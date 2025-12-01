@@ -26,8 +26,8 @@ if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
 if not SERPAPI_KEY:
     raise RuntimeError("Missing SERPAPI_KEY")
-if not ALPHAVANTAGE_KEY:
-    raise RuntimeError("Missing ALPHAVANTAGE_KEY")
+if not any([ALPHAVANTAGE_KEY, FINNHUB_KEY, TWELVEDATA_KEY, RAPIDAPI_KEY]):
+    raise RuntimeError("Нужен хотя бы один ключ цен (ALPHAVANTAGE/FINNHUB/TWELVEDATA/RAPIDAPI)")
 
 TZ = pytz.timezone("Europe/Warsaw")
 
@@ -35,13 +35,14 @@ TZ = pytz.timezone("Europe/Warsaw")
 # ====== Состояние подписок (в памяти) ======
 @dataclass
 class ChatState:
-    companies: Set[str] = field(default_factory=set)  # названия компаний для новостей
-    tickers: Set[str] = field(default_factory=set)  # тикеры для цен
-    news_seen_ids: Set[str] = field(default_factory=set)  # чтобы не дублировать новости
+    companies: Set[str] = field(default_factory=set)
+    tickers: Set[str] = field(default_factory=set)
+    news_seen_ids: Set[str] = field(default_factory=set)
     interval_min: int = 10
     price_threshold_pct: float = 2.0
     running: bool = False
     task: asyncio.Task | None = None
+    debug: bool = False   # 👈 новое поле
 
 
 STATES: Dict[int, ChatState] = {}  # chat_id -> ChatState
@@ -123,10 +124,15 @@ async def fetch_alpha_global_quote(session: aiohttp.ClientSession, symbol: str):
     params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHAVANTAGE_KEY}
     try:
         async with session.get(url, params=params, timeout=20) as r:
-            if r.status == 429:
+            # 429 бывает редко; чаще 200 + "Note"
+            if r.status in (403, 429):
                 return None, None
             r.raise_for_status()
             data = await r.json()
+        # частые "тихие" ответы при лимитах:
+        # {"Note": "..."} или {"Information": "..."} или {"Error Message": "..."}
+        if any(k in data for k in ("Note", "Information", "Error Message")):
+            return None, None
         q = data.get("Global Quote") or {}
         price = q.get("05. price")
         chg_pct = q.get("10. change percent")
@@ -192,9 +198,10 @@ async def fetch_twelvedata_price(session: aiohttp.ClientSession, symbol: str):
 
 
 async def fetch_yahoo_via_rapidapi(session: aiohttp.ClientSession, symbol: str):
-    """Yahoo Finance через RapidAPI (опционально). Возвращаем (price, change_pct)."""
+    """Yahoo Finance через RapidAPI. Отдаём pre/post/regular если доступны."""
     if not RAPIDAPI_KEY:
-        return None, None
+        return None, None, "Yahoo"
+
     url = "https://yahoo-finance127.p.rapidapi.com/price"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
@@ -204,34 +211,83 @@ async def fetch_yahoo_via_rapidapi(session: aiohttp.ClientSession, symbol: str):
     try:
         async with session.get(url, headers=headers, params=params, timeout=20) as r:
             if r.status == 429:
-                return None, None
+                return None, None, "Yahoo"
             r.raise_for_status()
             data = await r.json()
-        # формат может отличаться по провайдеру; часто есть fields regularMarketPrice / regularMarketChangePercent
+
         quote = data.get("price") or data
-        price = (
-            quote.get("regularMarketPrice", {}).get("raw")
-            if isinstance(quote.get("regularMarketPrice"), dict)
-            else quote.get("regularMarketPrice")
-        )
-        chg_pct = (
-            quote.get("regularMarketChangePercent", {}).get("raw")
-            if isinstance(quote.get("regularMarketChangePercent"), dict)
-            else quote.get("regularMarketChangePercent")
-        )
-        if price is None or chg_pct is None:
-            return None, None
-        return float(price), float(chg_pct)
+
+        def val(field):
+            v = quote.get(field)
+            return v.get("raw") if isinstance(v, dict) else v
+
+        pre_p,  pre_dp  = val("preMarketPrice"),           val("preMarketChangePercent")
+        post_p, post_dp = val("postMarketPrice"),          val("postMarketChangePercent")
+        reg_p,  reg_dp  = val("regularMarketPrice"),       val("regularMarketChangePercent")
+
+        if pre_p is not None and pre_dp is not None:
+            return float(pre_p),  float(pre_dp),  "Yahoo Pre-Market"
+        if post_p is not None and post_dp is not None:
+            return float(post_p), float(post_dp), "Yahoo Post-Market"
+        if reg_p is not None and reg_dp is not None:
+            return float(reg_p),  float(reg_dp),  "Yahoo Regular"
+
+        return None, None, "Yahoo"
     except Exception:
-        return None, None
+        return None, None, "Yahoo"
+
+async def fetch_yahoo_sessions(session: aiohttp.ClientSession, symbol: str):
+    """
+    Возвращает доступные сессии Yahoo: {'pre': (price, pct), 'post': (...), 'regular': (...)}
+    Если ключа RapidAPI нет или данных нет — вернёт {}.
+    """
+    if not RAPIDAPI_KEY:
+        return {}
+
+    url = "https://yahoo-finance127.p.rapidapi.com/price"
+    headers = {
+        "x-rapidapi-key": RAPIDAPI_KEY,
+        "x-rapidapi-host": "yahoo-finance127.p.rapidapi.com",
+    }
+    params = {"symbol": symbol}
+    try:
+        async with session.get(url, headers=headers, params=params, timeout=20) as r:
+            if r.status == 429:
+                return {}
+            r.raise_for_status()
+            data = await r.json()
+
+        quote = data.get("price") or data
+
+        def val(field):
+            v = quote.get(field)
+            return (v.get("raw") if isinstance(v, dict) else v)
+
+        pre_p,  pre_dp  = val("preMarketPrice"),           val("preMarketChangePercent")
+        post_p, post_dp = val("postMarketPrice"),          val("postMarketChangePercent")
+        reg_p,  reg_dp  = val("regularMarketPrice"),       val("regularMarketChangePercent")
+
+        out = {}
+        if pre_p  is not None and pre_dp  is not None: out["pre"]     = (float(pre_p),  float(pre_dp))
+        if post_p is not None and post_dp is not None: out["post"]    = (float(post_p), float(post_dp))
+        if reg_p  is not None and reg_dp  is not None: out["regular"] = (float(reg_p),  float(reg_dp))
+        return out
+    except Exception:
+        return {}
 
 
 async def get_stock_price(session: aiohttp.ClientSession, symbol: str):
     """
-    Fallback-цепочка:
-        Alpha Vantage -> Finnhub -> Twelve Data -> Yahoo(RapidAPI).
-    Возвращаем (price, change_pct, provider) или (None, None, 'none')
+    Предпочитаем pre/post с Yahoo (если ключ есть),
+    затем Alpha Vantage -> Finnhub -> TwelveData.
+    Возвращаем (price, change_pct, provider).
     """
+    # 0) Yahoo (даёт pre/post/regular)
+    if RAPIDAPI_KEY:
+        p, c, label = await fetch_yahoo_via_rapidapi(session, symbol)
+        if p is not None and c is not None:
+            return p, c, label
+
     # 1) Alpha Vantage
     p, c = await fetch_alpha_global_quote(session, symbol)
     if p is not None and c is not None:
@@ -247,13 +303,7 @@ async def get_stock_price(session: aiohttp.ClientSession, symbol: str):
     if p is not None and c is not None:
         return p, c, "TwelveData"
 
-    # 4) Yahoo (RapidAPI)
-    p, c = await fetch_yahoo_via_rapidapi(session, symbol)
-    if p is not None and c is not None:
-        return p, c, "Yahoo(RapidAPI)"
-
     return None, None, "none"
-
 
 # ====== Фоновая задача ======
 async def monitor_chat(bot: Bot, chat_id: int):
@@ -286,29 +336,36 @@ async def monitor_chat(bot: Bot, chat_id: int):
                     pass
 
             # --- Цены по тикерам ---
+
             for t in sorted(state.tickers):
                 try:
+                    if RAPIDAPI_KEY:
+                        sessions = await fetch_yahoo_sessions(session, t)
+                        if "pre" in sessions:
+                            p, c = sessions["pre"]
+                            msgs.append(f"🕒 Pre-Market {t}: {p:.2f} USD ({c:+.2f}%) • Yahoo")
+
                     price, chg, provider = await get_stock_price(session, t)
                     if price is None or chg is None:
                         continue
-                    if abs(chg) >= state.price_threshold_pct:
-                        arrow = "📈" if chg > 0 else "📉"
+                    if abs(chg) >= state.price_threshold_pct or state.debug:
+                        arrow = "📈" if chg > 0 else "📉" if chg < 0 else "➡️"
+                        dbg = " (debug)" if state.debug and abs(chg) < state.price_threshold_pct else ""
                         msgs.append(
-                            f"{arrow} {t}: {price:.2f} USD ({chg:+.2f}%) • {provider}\n"
+                            f"{arrow} {t}: {price:.2f} USD ({chg:+.2f}%) • {provider}{dbg}\n"
                             f"https://finance.yahoo.com/quote/{t}"
                         )
                 except Exception:
                     pass
 
-        # Отправляем сгруппировано, чтобы не спамить
-        if msgs:
-            text = "\n\n".join(msgs)
-            # бьем на куски < 4000 символов
-            for chunk in split_message(text):
-                await bot.send_message(chat_id, chunk, disable_web_page_preview=False)
+            if msgs:
+                text = "\n\n".join(msgs)
+                # бьем на куски < 4000 символов
+                for chunk in split_message(text):
+                    await bot.send_message(chat_id, chunk, disable_web_page_preview=False)
 
-        # Ждем до следующего цикла
-        await asyncio.sleep(state.interval_min * 60)
+            # Ждём до следующего цикла опроса
+            await asyncio.sleep(state.interval_min * 60)
 
 
 def split_message(text: str, limit: int = 4000):
@@ -437,7 +494,7 @@ async def cmd_threshold(m: Message):
         await m.answer("Неверное число. Пример: /threshold 1.5")
         return
     state = STATES.setdefault(m.chat.id, ChatState())
-    state.price_threshold_pct = max(0.1, val)
+    state.price_threshold_pct = max(0.00001, val)
     await m.answer(f"Порог уведомления по цене: {state.price_threshold_pct}%.")
 
 
@@ -462,7 +519,7 @@ async def stop_feed(m: Message):
     await m.answer("Мониторинг остановлен ⏸️")
 
 
-@dp.message(F.text & ~F.via_bot)
+@dp.message(F.text & ~F.via_bot & ~F.text.regexp(r'^/'))
 async def fallback(m: Message):
     await m.answer("Неизвестная команда. Используй /help или /start.")
 
@@ -471,6 +528,56 @@ async def fallback(m: Message):
 async def help_cmd(m: Message):
     await cmd_start(m)
 
+@dp.message(Command("price"))
+async def cmd_price(m: Message, command: Command = None):
+    text = (m.text or "").strip()
+    arg = text.split(maxsplit=1)
+    symbol = ""
+    if len(arg) > 1:
+        symbol = arg[1].strip()
+    else:
+        await m.answer("Использование: /price <тикер>, напр. /price NVDA")
+        return
+
+    symbol = symbol.upper()
+    async with aiohttp.ClientSession() as session:
+        price, chg, provider = await get_stock_price(session, symbol)
+
+    if price is None or chg is None:
+        await m.answer(f"Не удалось получить котировку для {symbol}. Возможны лимиты или нерабочие часы.")
+        return
+
+    arrow = "📈" if chg > 0 else "📉" if chg < 0 else "➡️"
+    await m.answer(
+        f"{arrow} {symbol}: {price:.2f} USD ({chg:+.2f}%) • {provider}\n"
+        f"https://finance.yahoo.com/quote/{symbol}"
+    )
+
+@dp.message(Command("premarket"))
+async def cmd_premarket(m: Message):
+    parts = (m.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Использование: /premarket <тикер>, напр. /premarket NVDA")
+        return
+    symbol = parts[1].strip().upper()
+    async with aiohttp.ClientSession() as session:
+        sessions = await fetch_yahoo_sessions(session, symbol)
+
+    if not RAPIDAPI_KEY:
+        await m.answer("RAPIDAPI_KEY не задан — не могу получить Pre-Market с Yahoo.")
+        return
+    if not sessions:
+        await m.answer(f"Для {symbol} сейчас нет данных Yahoo (pre/post/regular).")
+        return
+
+    lines = [f"Доступные сессии Yahoo для {symbol}:"]
+    if "pre" in sessions:
+        p, c = sessions["pre"];  lines.append(f"🕒 Pre-Market: {p:.2f} USD ({c:+.2f}%)")
+    if "post" in sessions:
+        p, c = sessions["post"]; lines.append(f"🌙 Post-Market: {p:.2f} USD ({c:+.2f}%)")
+    if "regular" in sessions:
+        p, c = sessions["regular"]; lines.append(f"🏛 Regular: {p:.2f} USD ({c:+.2f}%)")
+    await m.answer("\n".join(lines))
 
 # ====== Запуск ======
 async def main():
